@@ -1,5 +1,5 @@
 /*
-© Copyright IBM Corporation 2019, 2021
+© Copyright IBM Corporation 2019, 2023
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package tls
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	pwr "math/rand"
 	"os"
 	"path/filepath"
@@ -76,18 +75,20 @@ type TLSStore struct {
 	Truststore KeyStoreData
 }
 
-func configureTLSKeystores(keystoreDir, keyDir, trustDir string, p12TruststoreRequired bool) (string, KeyStoreData, KeyStoreData, error) {
-
+func configureTLSKeystores(keystoreDir, keyDir, trustDir string, p12TruststoreRequired bool, nativeTLSHA bool) (string, KeyStoreData, KeyStoreData, error) {
+	var keyLabel string
 	// Create the CMS Keystore & PKCS#12 Truststore (if required)
-	tlsStore, err := generateAllKeystores(keystoreDir, p12TruststoreRequired)
+	tlsStore, err := generateAllKeystores(keystoreDir, p12TruststoreRequired, nativeTLSHA)
 	if err != nil {
 		return "", tlsStore.Keystore, tlsStore.Truststore, err
 	}
 
-	// Process all keys - add them to the CMS KeyStore
-	keyLabel, err := processKeys(&tlsStore, keystoreDir, keyDir)
-	if err != nil {
-		return "", tlsStore.Keystore, tlsStore.Truststore, err
+	if tlsStore.Keystore.Keystore != nil {
+		// Process all keys - add them to the CMS KeyStore
+		keyLabel, err = processKeys(&tlsStore, keystoreDir, keyDir)
+		if err != nil {
+			return "", tlsStore.Keystore, tlsStore.Truststore, err
+		}
 	}
 
 	// Process all trust certificates - add them to the CMS KeyStore & PKCS#12 Truststore (if required)
@@ -101,13 +102,13 @@ func configureTLSKeystores(keystoreDir, keyDir, trustDir string, p12TruststoreRe
 
 // ConfigureDefaultTLSKeystores configures the CMS Keystore & PKCS#12 Truststore
 func ConfigureDefaultTLSKeystores() (string, KeyStoreData, KeyStoreData, error) {
-	return configureTLSKeystores(keystoreDirDefault, keyDirDefault, trustDirDefault, true)
+	return configureTLSKeystores(keystoreDirDefault, keyDirDefault, trustDirDefault, true, false)
 }
 
 // ConfigureHATLSKeystore configures the CMS Keystore & PKCS#12 Truststore
 func ConfigureHATLSKeystore() (string, KeyStoreData, KeyStoreData, error) {
 	// *.crt files mounted to the HA TLS dir keyDirHA will be processed as trusted in the CMS keystore
-	return configureTLSKeystores(keystoreDirHA, keyDirHA, keyDirHA, false)
+	return configureTLSKeystores(keystoreDirHA, keyDirHA, keyDirHA, false, true)
 }
 
 // ConfigureTLS configures TLS for the queue manager
@@ -115,10 +116,26 @@ func ConfigureTLS(keyLabel string, cmsKeystore KeyStoreData, devMode bool, log *
 
 	const mqsc string = "/etc/mqm/15-tls.mqsc"
 	const mqscTemplate string = mqsc + ".tpl"
+	sslKeyRing := ""
+	var fipsEnabled = "NO"
+
+	// Don't set SSLKEYR if no keys or crts are not supplied
+	// Key label will be blank if no private keys were added during processing keys and certs.
+	if cmsKeystore.Keystore != nil && len(keyLabel) > 0 {
+		certList, _ := cmsKeystore.Keystore.ListAllCertificates()
+		if len(certList) > 0 {
+			sslKeyRing = strings.TrimSuffix(cmsKeystore.Keystore.Filename, ".kdb")
+		}
+
+		if cmsKeystore.Keystore.IsFIPSEnabled() {
+			fipsEnabled = "YES"
+		}
+	}
 
 	err := mqtemplate.ProcessTemplateFile(mqscTemplate, mqsc, map[string]string{
-		"SSLKeyR":          strings.TrimSuffix(cmsKeystore.Keystore.Filename, ".kdb"),
+		"SSLKeyR":          sslKeyRing,
 		"CertificateLabel": keyLabel,
+		"SSLFips":          fipsEnabled,
 	}, log)
 	if err != nil {
 		return err
@@ -159,7 +176,7 @@ func configureTLSDev(log *logger.Logger) error {
 }
 
 // generateAllKeystores creates the CMS Keystore & PKCS#12 Truststore (if required)
-func generateAllKeystores(keystoreDir string, p12TruststoreRequired bool) (TLSStore, error) {
+func generateAllKeystores(keystoreDir string, p12TruststoreRequired bool, nativeTLSHA bool) (TLSStore, error) {
 
 	var cmsKeystore, p12Truststore KeyStoreData
 
@@ -175,11 +192,19 @@ func generateAllKeystores(keystoreDir string, p12TruststoreRequired bool) (TLSSt
 		return TLSStore{cmsKeystore, p12Truststore}, fmt.Errorf("Failed to create Keystore directory: %v", err)
 	}
 
-	// Create the CMS Keystore
-	cmsKeystore.Keystore = keystore.NewCMSKeyStore(filepath.Join(keystoreDir, cmsKeystoreName), cmsKeystore.Password)
-	err = cmsKeystore.Keystore.Create()
-	if err != nil {
-		return TLSStore{cmsKeystore, p12Truststore}, fmt.Errorf("Failed to create CMS Keystore: %v", err)
+	// Search the default keys directory for any keys/certs.
+	keysDirectory := keyDirDefault
+	// Change to default native HA TLS directory if we are configuring nativeHA
+	if nativeTLSHA {
+		keysDirectory = keyDirHA
+	}
+	// Create the CMS Keystore if we have been provided keys and certificates
+	if haveKeysAndCerts(keysDirectory) || haveKeysAndCerts(trustDirDefault) {
+		cmsKeystore.Keystore = keystore.NewCMSKeyStore(filepath.Join(keystoreDir, cmsKeystoreName), cmsKeystore.Password)
+		err = cmsKeystore.Keystore.Create()
+		if err != nil {
+			return TLSStore{cmsKeystore, p12Truststore}, fmt.Errorf("Failed to create CMS Keystore: %v", err)
+		}
 	}
 
 	// Create the PKCS#12 Truststore (if required)
@@ -201,12 +226,11 @@ func processKeys(tlsStore *TLSStore, keystoreDir string, keyDir string) (string,
 	keyLabel := ""
 
 	// Process all keys
-	keyList, err := ioutil.ReadDir(keyDir)
+	keyList, err := os.ReadDir(keyDir)
 	if err == nil && len(keyList) > 0 {
-
 		// Process each set of keys - each set should contain files: *.key & *.crt
 		for _, keySet := range keyList {
-			keys, _ := ioutil.ReadDir(filepath.Join(keyDir, keySet.Name()))
+			keys, _ := os.ReadDir(filepath.Join(keyDir, keySet.Name()))
 
 			// Ensure the label of the set of keys does not match the name of the PKCS#12 Truststore
 			if keySet.Name() == p12TruststoreName[0:len(p12TruststoreName)-len(filepath.Ext(p12TruststoreName))] {
@@ -230,12 +254,20 @@ func processKeys(tlsStore *TLSStore, keystoreDir string, keyDir string) (string,
 				return "", err
 			}
 
+			// Validate certificates for duplicate Subject DNs
+			if len(caCertificate) > 0 {
+				errCertValid := validateCertificates(publicCertificate, caCertificate)
+				if errCertValid != nil {
+					return "", errCertValid
+				}
+			}
 			// Create a new PKCS#12 Keystore - containing private key, public certificate & optional CA certificate
 			file, err := pkcs.Encode(rand.Reader, privateKey, publicCertificate, caCertificate, tlsStore.Keystore.Password)
 			if err != nil {
 				return "", fmt.Errorf("Failed to encode PKCS#12 Keystore %s: %v", keySet.Name()+".p12", err)
 			}
-			err = ioutil.WriteFile(filepath.Join(keystoreDir, keySet.Name()+".p12"), file, 0644)
+			// #nosec G306 - this gives permissions to owner/s group only.
+			err = os.WriteFile(filepath.Join(keystoreDir, keySet.Name()+".p12"), file, 0644)
 			if err != nil {
 				return "", fmt.Errorf("Failed to write PKCS#12 Keystore %s: %v", filepath.Join(keystoreDir, keySet.Name()+".p12"), err)
 			}
@@ -266,17 +298,17 @@ func processKeys(tlsStore *TLSStore, keystoreDir string, keyDir string) (string,
 func processTrustCertificates(tlsStore *TLSStore, trustDir string) error {
 
 	// Process all trust certiifcates
-	trustList, err := ioutil.ReadDir(trustDir)
+	trustList, err := os.ReadDir(trustDir)
 	if err == nil && len(trustList) > 0 {
 
 		// Process each set of keys
 		for _, trustSet := range trustList {
-			keys, _ := ioutil.ReadDir(filepath.Join(trustDir, trustSet.Name()))
+			keys, _ := os.ReadDir(filepath.Join(trustDir, trustSet.Name()))
 
 			for _, key := range keys {
 				if strings.HasSuffix(key.Name(), ".crt") {
 					// #nosec G304 - filename variable is derived from contents of 'trustDir' which is a defined constant
-					file, err := ioutil.ReadFile(filepath.Join(trustDir, trustSet.Name(), key.Name()))
+					file, err := os.ReadFile(filepath.Join(trustDir, trustSet.Name(), key.Name()))
 					if err != nil {
 						return fmt.Errorf("Failed to read file %s: %v", filepath.Join(trustDir, trustSet.Name(), key.Name()), err)
 					}
@@ -327,7 +359,7 @@ func processTrustCertificates(tlsStore *TLSStore, trustDir string) error {
 }
 
 // processPrivateKey processes the private key (*.key) from a set of keys
-func processPrivateKey(keyDir string, keySetName string, keys []os.FileInfo) (interface{}, string, error) {
+func processPrivateKey(keyDir string, keySetName string, keys []os.DirEntry) (interface{}, string, error) {
 
 	var privateKey interface{}
 	keyPrefix := ""
@@ -336,7 +368,7 @@ func processPrivateKey(keyDir string, keySetName string, keys []os.FileInfo) (in
 
 		if strings.HasSuffix(key.Name(), ".key") {
 			// #nosec G304 - filename variable is derived from contents of 'keyDir' which is a defined constant
-			file, err := ioutil.ReadFile(filepath.Join(keyDir, keySetName, key.Name()))
+			file, err := os.ReadFile(filepath.Join(keyDir, keySetName, key.Name()))
 			if err != nil {
 				return nil, "", fmt.Errorf("Failed to read private key %s: %v", filepath.Join(keyDir, keySetName, key.Name()), err)
 			}
@@ -362,7 +394,7 @@ func processPrivateKey(keyDir string, keySetName string, keys []os.FileInfo) (in
 }
 
 // processCertificates processes the certificates (*.crt) from a set of keys
-func processCertificates(keyDir string, keySetName, keyPrefix string, keys []os.FileInfo, cmsKeystore, p12Truststore *KeyStoreData) (*x509.Certificate, []*x509.Certificate, error) {
+func processCertificates(keyDir string, keySetName, keyPrefix string, keys []os.DirEntry, cmsKeystore, p12Truststore *KeyStoreData) (*x509.Certificate, []*x509.Certificate, error) {
 
 	var publicCertificate *x509.Certificate
 	var caCertificate []*x509.Certificate
@@ -371,7 +403,7 @@ func processCertificates(keyDir string, keySetName, keyPrefix string, keys []os.
 
 		if strings.HasPrefix(key.Name(), keyPrefix) && strings.HasSuffix(key.Name(), ".crt") {
 			// #nosec G304 - filename variable is derived from contents of 'keyDir' which is a defined constant
-			file, err := ioutil.ReadFile(filepath.Join(keyDir, keySetName, key.Name()))
+			file, err := os.ReadFile(filepath.Join(keyDir, keySetName, key.Name()))
 			if err != nil {
 				return nil, nil, fmt.Errorf("Failed to read public certificate %s: %v", filepath.Join(keyDir, keySetName, key.Name()), err)
 			}
@@ -392,7 +424,7 @@ func processCertificates(keyDir string, keySetName, keyPrefix string, keys []os.
 
 		} else if strings.HasSuffix(key.Name(), ".crt") {
 			// #nosec G304 - filename variable is derived from contents of 'keyDir' which is a defined constant
-			file, err := ioutil.ReadFile(filepath.Join(keyDir, keySetName, key.Name()))
+			file, err := os.ReadFile(filepath.Join(keyDir, keySetName, key.Name()))
 			if err != nil {
 				return nil, nil, fmt.Errorf("Failed to read CA certificate %s: %v", filepath.Join(keyDir, keySetName, key.Name()), err)
 			}
@@ -538,6 +570,7 @@ func generateRandomPassword() string {
 	validcharArray := []byte(validChars)
 	password := ""
 	for i := 0; i < 12; i++ {
+		// #nosec G404 - this is only for internal keystore and using math/rand pose no harm.
 		password = password + string(validcharArray[pwr.Intn(len(validcharArray))])
 	}
 
@@ -582,10 +615,13 @@ func getCertificateFingerprint(block *pem.Block) (string, error) {
 
 // writeCertificatesToFile writes a list of certificates to a file
 func writeCertificatesToFile(file string, certificates []*pem.Block) error {
+
+	// #nosec G304 - this is a temporary pem file to write certs.
 	f, err := os.Create(file)
 	if err != nil {
 		return fmt.Errorf("Failed to create file %s: %v", file, err)
 	}
+	// #nosec G307 - local to this function, pose no harm.
 	defer f.Close()
 
 	w := bufio.NewWriter(f)
@@ -598,6 +634,42 @@ func writeCertificatesToFile(file string, certificates []*pem.Block) error {
 		err = w.Flush()
 		if err != nil {
 			return fmt.Errorf("Failed to write certificate to file %s: %v", file, err)
+		}
+	}
+	return nil
+}
+
+// Search the specified directory for .key and .crt files.
+// Return true if at least one .key or .crt file is found else false
+func haveKeysAndCerts(keyDir string) bool {
+	fileList, err := os.ReadDir(keyDir)
+	if err == nil && len(fileList) > 0 {
+		for _, fileInfo := range fileList {
+			// Keys and certs will be supplied in an user defined subdirectory.
+			// Do a listing of the subdirectory and then search for .key and .cert files
+			keys, _ := os.ReadDir(filepath.Join(keyDir, fileInfo.Name()))
+			for _, key := range keys {
+				if strings.HasSuffix(key.Name(), ".key") || strings.HasSuffix(key.Name(), ".crt") {
+					// We found at least one key/crt file.
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// Iterate through the certificates to ensure there are no two certificates with same Subject DN.
+// GSKit does not allow two certificates with same Subject DN/Friendly Names
+func validateCertificates(personalCert *x509.Certificate, caCertificates []*x509.Certificate) error {
+	// Check if we have been asked to override certificate validation by setting
+	// MQ_ENABLE_CERT_VALIDATION to false
+	enableValidation, enableValidationSet := os.LookupEnv("MQ_ENABLE_CERT_VALIDATION")
+	if !enableValidationSet || (enableValidationSet && !strings.EqualFold(strings.Trim(enableValidation, ""), "false")) {
+		for _, caCert := range caCertificates {
+			if strings.EqualFold(personalCert.Subject.String(), caCert.Subject.String()) {
+				return fmt.Errorf("Error: The Subject DN of the Issuer Certificate and the Queue Manager are same")
+			}
 		}
 	}
 	return nil

@@ -1,5 +1,5 @@
 /*
-© Copyright IBM Corporation 2017, 2019
+© Copyright IBM Corporation 2017, 2023
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,44 +18,59 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 
 	"github.com/ibm-messaging/mq-container/internal/ready"
 	"github.com/ibm-messaging/mq-container/pkg/name"
 )
 
-func main() {
+func doMain() int {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+
 	// Check if runmqserver has indicated that it's finished configuration
 	r, err := ready.Check()
 	if !r || err != nil {
-		os.Exit(1)
+		return 1
 	}
 	name, err := name.GetQueueManagerName()
 	if err != nil {
 		fmt.Println(err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Check if the queue manager has a running listener
-	if active, _ := ready.IsRunningAsActiveQM(name); active {
+	status, err := ready.Status(ctx, name)
+	if err != nil {
+		return 1
+	}
+	switch status {
+	case ready.StatusActiveQM:
 		conn, err := net.Dial("tcp", "127.0.0.1:1414")
 		if err != nil {
 			fmt.Println(err)
-			os.Exit(1)
+			return 1
 		}
 		err = conn.Close()
 		if err != nil {
 			fmt.Println(err)
 		}
-	} else if standby, _ := ready.IsRunningAsStandbyQM(name); standby {
+		return 0
+	case ready.StatusStandbyQM:
 		fmt.Printf("Detected queue manager running in standby mode")
-		os.Exit(10)
-	} else if replica, _ := ready.IsRunningAsReplicaQM(name); replica {
+		return 10
+	case ready.StatusReplicaQM:
 		fmt.Printf("Detected queue manager running in replica mode")
-		os.Exit(20)
-	} else {
-		os.Exit(1)
+		return 20
+	default:
+		return 1
 	}
+}
+
+func main() {
+	os.Exit(doMain())
 }

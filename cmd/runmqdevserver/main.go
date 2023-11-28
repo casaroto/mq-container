@@ -1,5 +1,5 @@
 /*
-© Copyright IBM Corporation 2018, 2021
+© Copyright IBM Corporation 2018, 2023
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/ibm-messaging/mq-container/internal/htpasswd"
@@ -30,7 +30,20 @@ import (
 var log *logger.Logger
 
 func getLogFormat() string {
-	return os.Getenv("LOG_FORMAT")
+	logFormat := strings.ToLower(strings.TrimSpace(os.Getenv("MQ_LOGGING_CONSOLE_FORMAT")))
+	//old-style env var is used.
+	if logFormat == "" {
+		logFormat = strings.ToLower(strings.TrimSpace(os.Getenv("LOG_FORMAT")))
+	}
+
+	if logFormat != "" && (logFormat == "basic" || logFormat == "json") {
+		return logFormat
+	} else {
+		//this is the case where value is either empty string or set to something other than "basic"/"json"
+		logFormat = "basic"
+	}
+
+	return logFormat
 }
 
 func getDebug() bool {
@@ -77,7 +90,8 @@ func logTermination(args ...interface{}) {
 	// Write the message to the termination log.  This is not the default place
 	// that Kubernetes will look for termination information.
 	log.Debugf("Writing termination message: %v", msg)
-	err := ioutil.WriteFile("/run/termination-log", []byte(msg), 0660)
+	// #nosec G306 - its a read by owner/s group, and pose no harm.
+	err := os.WriteFile("/run/termination-log", []byte(msg), 0660)
 	if err != nil {
 		log.Debug(err)
 	}

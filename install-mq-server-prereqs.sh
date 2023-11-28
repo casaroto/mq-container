@@ -1,6 +1,6 @@
 #!/bin/bash
 # -*- mode: sh -*-
-# © Copyright IBM Corporation 2015, 2021
+# © Copyright IBM Corporation 2015, 2023
 #
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ test -f /usr/bin/yum && YUM=true || YUM=false
 test -f /usr/bin/microdnf && MICRODNF=true || MICRODNF=false
 test -f /usr/bin/rpm && RPM=true || RPM=false
 test -f /usr/bin/apt-get && UBUNTU=true || UBUNTU=false
+CPU_ARCH=$(uname -m)
 
 if ($UBUNTU); then
   export DEBIAN_FRONTEND=noninteractive
@@ -29,8 +30,7 @@ if ($UBUNTU); then
   # This ensures no unsupported code gets installed, and makes the build faster
   source /etc/os-release
   # Figure out the correct apt URL based on the CPU architecture
-  CPU_ARCH=$(uname -p)
-  if [ ${CPU_ARCH} == "x86_64" ]; then
+  if [ "${CPU_ARCH}" == "x86_64" ]; then
      APT_URL="http://archive.ubuntu.com/ubuntu/"
   else
      APT_URL="http://ports.ubuntu.com/ubuntu-ports/"
@@ -41,25 +41,9 @@ if ($UBUNTU); then
   echo "deb ${APT_URL} ${UBUNTU_CODENAME}-updates main restricted" >> /etc/apt/sources.list
   echo "deb ${APT_URL} ${UBUNTU_CODENAME}-security main restricted" >> /etc/apt/sources.list
   # Install additional packages required by MQ, this install process and the runtime scripts
+  EXTRA_DEBS="bash bc ca-certificates coreutils curl debianutils file findutils gawk grep libc-bin mount passwd procps sed tar util-linux"
   apt-get update
-  apt-get install -y --no-install-recommends \
-    bash \
-    bc \
-    ca-certificates \
-    coreutils \
-    curl \
-    debianutils \
-    file \
-    findutils \
-    gawk \
-    grep \
-    libc-bin \
-    mount \
-    passwd \
-    procps \
-    sed \
-    tar \
-    util-linux 
+  apt-get install -y --no-install-recommends ${EXTRA_DEBS}
 fi
 
 if ($RPM); then

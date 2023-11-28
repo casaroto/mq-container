@@ -2,10 +2,9 @@
 
 ## Prerequisites
 You need to ensure you have the following tools installed:
-* [Docker](https://www.docker.com/)
+* [Docker](https://www.docker.com/) 19.03 or higher (API version 1.40)
 * [GNU make](https://www.gnu.org/software/make/)
 * [Go](https://golang.org/) - only needed for running the tests
-* [dep](https://github.com/golang/dep) (official Go dependency management tool) - needed to prepare for running the tests
 
 ## Running the tests
 There are two main sets of tests:
@@ -18,14 +17,14 @@ There are two main sets of tests:
 The Docker tests can be run locally on a machine with Docker. For example:
 
 ```
-make devserver
-make advancedserver
+make test-devserver
+make test-advancedserver
 ```
 
 You can specify the image to use directly by using the `MQ_IMAGE_ADVANCEDSERVER` or `MQ_IMAGE_DEVSERVER` variables, for example:
 
 ```
-MQ_IMAGE_ADVANCEDSERVER=ibm-mqadvanced-server:9.2.5.0-amd64 make test-advancedserver
+MQ_IMAGE_ADVANCEDSERVER=ibm-mqadvanced-server:9.3.4.0-amd64 make test-advancedserver
 ```
 
 You can pass parameters to `go test` with an environment variable.  For example, to run the "TestGoldenPath" test, run the following command:

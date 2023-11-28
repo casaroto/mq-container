@@ -1,5 +1,5 @@
 /*
-© Copyright IBM Corporation 2017, 2021
+© Copyright IBM Corporation 2017, 2023
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/ibm-messaging/mq-container/internal/fips"
 	"github.com/ibm-messaging/mq-container/internal/ha"
 	"github.com/ibm-messaging/mq-container/internal/metrics"
 	"github.com/ibm-messaging/mq-container/internal/ready"
@@ -144,6 +145,9 @@ func doMain() error {
 	// Print out versioning information
 	logVersionInfo()
 
+	// Determine FIPS compliance level
+	fips.ProcessFIPSType(log)
+
 	keyLabel, defaultCmsKeystore, defaultP12Truststore, err := tls.ConfigureDefaultTLSKeystores()
 	if err != nil {
 		logTermination(err)
@@ -154,6 +158,32 @@ func doMain() error {
 	if err != nil {
 		logTermination(err)
 		return err
+	}
+
+	//Validate MQ_LOG_CONSOLE_SOURCE variable
+	if !isLogConsoleSourceValid() {
+		log.Println("One or more invalid value is provided for MQ_LOGGING_CONSOLE_SOURCE. Allowed values are 'qmgr' & 'web' in csv format")
+	}
+
+	var wg sync.WaitGroup
+	defer func() {
+		log.Debug("Waiting for log mirroring to complete")
+		wg.Wait()
+	}()
+	ctx, cancelMirror := context.WithCancel(context.Background())
+	defer func() {
+		log.Debug("Cancel log mirroring")
+		cancelMirror()
+	}()
+
+	//For mirroring web server logs if source variable is set
+	if checkLogSourceForMirroring("web") {
+		// Always log from the end of the web server messages.log, because the log rotation should happen as soon as the web server starts
+		_, err = mirrorWebServerLogs(ctx, &wg, name, false, mf)
+		if err != nil {
+			logTermination(err)
+			return err
+		}
 	}
 
 	err = postInit(name, keyLabel, defaultP12Truststore)
@@ -169,6 +199,9 @@ func doMain() error {
 			return err
 		}
 	}
+
+	// Post FIPS initialization processing
+	fips.PostInit(log)
 
 	enableTraceCrtmqm := os.Getenv("MQ_ENABLE_TRACE_CRTMQM")
 	if enableTraceCrtmqm == "true" || enableTraceCrtmqm == "1" {
@@ -193,38 +226,25 @@ func doMain() error {
 		}
 	}
 
-	var wg sync.WaitGroup
-	defer func() {
-		log.Debug("Waiting for log mirroring to complete")
-		wg.Wait()
-	}()
-	ctx, cancelMirror := context.WithCancel(context.Background())
-	defer func() {
-		log.Debug("Cancel log mirroring")
-		cancelMirror()
-	}()
-	// TODO: Use the error channel
-	_, err = mirrorSystemErrorLogs(ctx, &wg, mf)
-	if err != nil {
-		logTermination(err)
-		return err
-	}
-	_, err = mirrorQueueManagerErrorLogs(ctx, &wg, name, newQM, mf)
-	if err != nil {
-		logTermination(err)
-		return err
-	}
-	if *devFlag {
-		_, err = mirrorHTPasswdLogs(ctx, &wg, name, newQM, mf)
+	//For mirroring mq system logs and qm logs, if environment variable is set
+	if checkLogSourceForMirroring("qmgr") {
+		//Mirror MQ system logs
+		_, err = mirrorSystemErrorLogs(ctx, &wg, mf)
+		if err != nil {
+			logTermination(err)
+			return err
+		}
+
+		//Mirror queue manager logs
+		_, err = mirrorQueueManagerErrorLogs(ctx, &wg, name, newQM, mf)
 		if err != nil {
 			logTermination(err)
 			return err
 		}
 	}
-	// Recommended to use this option in conjunction with setting WLP_LOGGING_MESSAGE_FORMAT=JSON
-	mirrorWebLog := os.Getenv("MQ_ENABLE_EMBEDDED_WEB_SERVER_LOG")
-	if mirrorWebLog == "true" || mirrorWebLog == "1" {
-		_, err = mirrorWebServerLogs(ctx, &wg, name, newQM, mf)
+
+	if *devFlag {
+		_, err = mirrorHTPasswdLogs(ctx, &wg, name, newQM, mf)
 		if err != nil {
 			logTermination(err)
 			return err

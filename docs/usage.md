@@ -14,7 +14,7 @@ docker run \
   --publish 1414:1414 \
   --publish 9443:9443 \
   --detach \
-  ibmcom/mq
+  icr.io/ibm-messaging/mq
 ```
 
 ## Running with the default configuration and a volume
@@ -34,7 +34,7 @@ docker run \
   --publish 9443:9443 \
   --detach \
   --volume qm1data:/mnt/mqm \
-  ibmcom/mq
+  icr.io/ibm-messaging/mq
 ```
 
 The Docker image always uses `/mnt/mqm` for MQ data, which is correctly linked for you under `/var/mqm` at runtime.  This is to handle problems with file permissions on some platforms.
@@ -51,7 +51,7 @@ docker run \
   --publish 9443:9443 \
   --publish 9157:9157 \
   --detach \
-  ibmcom/mq
+  icr.io/ibm-messaging/mq
 ```
 
 ## Customizing the queue manager configuration
@@ -60,14 +60,14 @@ You can customize the configuration in several ways:
 
 1. For getting started, you can use the [default developer configuration](developer-config.md), which is available out-of-the-box for the MQ Advanced for Developers image
 2. By creating your own image and adding your own MQSC file into the `/etc/mqm` directory on the image.  This file will be run when your queue manager is created.
-3. By using [remote MQ administration](https://www.ibm.com/support/knowledgecenter/SSFKSJ_9.2.0/com.ibm.mq.adm.doc/q021090_.htm), via an MQ command server, the MQ HTTP APIs, or using a tool such as the MQ web console or MQ Explorer.
+3. By using [remote MQ administration](https://www.ibm.com/support/knowledgecenter/SSFKSJ_9.3.0/com.ibm.mq.adm.doc/q021090_.htm), via an MQ command server, the MQ HTTP APIs, or using a tool such as the MQ web console or MQ Explorer.
 
 Note that a listener is always created on port 1414 inside the container.  This port can be mapped to any port on the Docker host.
 
 The following is an *example* `Dockerfile` for creating your own pre-configured image, which adds a custom MQ configuration file:
 
 ```dockerfile
-FROM ibmcom/mq
+FROM icr.io/ibm-messaging/mq
 USER 1001
 COPY 20-config.mqsc /etc/mqm/
 ```
@@ -112,3 +112,5 @@ For example, if you have an identity certificate you wish to add with the label 
 This can be achieved by either mounting the directories or files into the container when you run it or by baking the files into the correct location in the image. 
 
 If you supply multiple identity certificates then the first label alphabetically will be chosen as the certificate to be used by the MQ Console and the default certificate for the queue manager. If you wish to use a different certificate on the queue manager then you can change the certificate to use at runtime by executing the MQSC command `ALTER QMGR CERTLABL('<newlabel>')`
+
+It must be noted that queue manager certificate with a Subject Distinguished Name (DN) same as it's Issuer certificate (CA) is not supported. Certificates must have a unique Subject Distinguished Name.

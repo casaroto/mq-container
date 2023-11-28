@@ -1,5 +1,5 @@
 /*
-© Copyright IBM Corporation 2018, 2019
+© Copyright IBM Corporation 2018, 2023
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,6 +35,8 @@ const (
 
 var (
 	metricsEnabled = false
+	// #nosec G112 - this code is changing soon to use https.
+	// for now we will ignore the gosec.
 	metricsServer  = &http.Server{Addr: ":" + defaultPort}
 )
 
@@ -43,8 +45,8 @@ func GatherMetrics(qmName string, log *logger.Logger) {
 
 	// If running in standby mode - wait until the queue manager becomes active
 	for {
-		active, _ := ready.IsRunningAsActiveQM(qmName)
-		if active {
+		status, _ := ready.Status(context.Background(), qmName)
+		if status.ActiveQM() {
 			break
 		}
 		time.Sleep(requestTimeout * time.Second)

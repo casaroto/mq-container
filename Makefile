@@ -1,4 +1,4 @@
-# © Copyright IBM Corporation 2017, 2021
+# © Copyright IBM Corporation 2017, 2023
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,15 @@
 ###############################################################################
 
 include config.env
+include source-branch.env
 
+# arch_uname is the platform architecture according to the uname program.  Can be differ by OS, e.g. `arm64` on macOS, but `aarch64` on Linux.
+arch_uname := $(shell uname -m)
+# arch_go is the platform architecture in Go-style (e.g. amd64, ppc64le, s390x or arm64).
+arch_go := $(if $(findstring x86_64,$(arch_uname)),amd64,$(if $(findstring aarch64,$(arch_uname)),arm64,$(arch_uname)))
+# ARCH is the platform architecture in Go-style (e.g. amd64, ppc64le, s390x or arm64).
+# Override this to build an image for a different architecture.  Note that RUN instructions will not be able to succeed without the help of emulation provided by packages like qemu-user-static.
+ARCH ?= $(arch_go)
 # RELEASE shows what release of the container code has been built
 RELEASE ?=
 # MQ_ARCHIVE_REPOSITORY is a remote repository from which to pull the MQ_ARCHIVE (if required)
@@ -37,10 +45,10 @@ MQ_ARCHIVE ?= IBM_MQ_$(MQ_VERSION_VRM)_$(MQ_ARCHIVE_TYPE)_$(MQ_ARCHIVE_ARCH)_NOI
 MQ_ARCHIVE_DEV ?= $(MQ_VERSION)-IBM-MQ-Advanced-for-Developers-Non-Install-$(MQ_ARCHIVE_DEV_TYPE)$(MQ_ARCHIVE_DEV_ARCH).tar.gz
 # MQ_SDK_ARCHIVE specifies the archive to use for building the golang programs.  Defaults vary on developer or advanced.
 MQ_SDK_ARCHIVE ?= $(MQ_ARCHIVE_DEV_$(MQ_VERSION))
-# Options to `go test` for the Docker tests
-TEST_OPTS_DOCKER ?=
-# Timeout for the Docker tests
-TEST_TIMEOUT_DOCKER ?= 30m
+# Options to `go test` for the Container tests
+TEST_OPTS_CONTAINER ?=
+# Timeout for the  tests
+TEST_TIMEOUT_CONTAINER ?= 45m
 # MQ_IMAGE_ADVANCEDSERVER is the name of the built MQ Advanced image
 MQ_IMAGE_ADVANCEDSERVER ?=ibm-mqadvanced-server
 # MQ_IMAGE_DEVSERVER is the name of the built MQ Advanced for Developers image
@@ -59,12 +67,6 @@ MQ_DELIVERY_REGISTRY_NAMESPACE ?=
 MQ_DELIVERY_REGISTRY_USER ?=
 # MQ_DELIVERY_REGISTRY_CREDENTIAL is the password/API key for the remote registry (if required)
 MQ_DELIVERY_REGISTRY_CREDENTIAL ?=
-# REGISTRY_USER is the username used to login to the Red Hat registry
-REGISTRY_USER ?=
-# REGISTRY_PASS is the password used to login to the Red Hat registry
-REGISTRY_PASS ?=
-# ARCH is the platform architecture (e.g. amd64, ppc64le or s390x)
-ARCH ?= $(if $(findstring x86_64,$(shell uname -m)),amd64,$(shell uname -m))
 # LTS is a boolean value to enable/disable LTS container build
 LTS ?= false
 # VOLUME_MOUNT_OPTIONS is used when bind-mounting files from the "downloads" directory into the container.  By default, SELinux labels are automatically re-written, but this doesn't work on some filesystems with extended attributes (xattrs).  You can turn off the label re-writing by setting this variable to be blank.
@@ -73,13 +75,15 @@ VOLUME_MOUNT_OPTIONS ?= :Z
 ###############################################################################
 # Other variables
 ###############################################################################
-# Build doesn't work if BuildKit is enabled
-DOCKER_BUILDKIT=0
+# Lock Docker API version for compatibility with Podman and with the Docker version in Travis' Ubuntu Bionic
+DOCKER_API_VERSION=1.40
 GO_PKG_DIRS = ./cmd ./internal ./test
 MQ_ARCHIVE_TYPE=LINUX
 MQ_ARCHIVE_DEV_TYPE=Linux
 # BUILD_SERVER_CONTAINER is the name of the web server container used at build time
 BUILD_SERVER_CONTAINER=build-server
+# BUILD_SERVER_NETWORK is the name of the network to use for the web server container used at build time
+BUILD_SERVER_NETWORK=build
 # NUM_CPU is the number of CPUs available to Docker.  Used to control how many
 # test run in parallel
 NUM_CPU ?= $(or $(shell $(COMMAND) info --format "{{ .NCPU }}"),2)
@@ -107,12 +111,22 @@ endif
 
 # Try to figure out which archive to use from the architecture
 ifeq "$(ARCH)" "amd64"
-	MQ_ARCHIVE_ARCH=X86-64
-	MQ_ARCHIVE_DEV_ARCH=X64
+	MQ_ARCHIVE_ARCH:=X86-64
+	MQ_ARCHIVE_DEV_ARCH:=X64
 else ifeq "$(ARCH)" "ppc64le"
-	MQ_ARCHIVE_ARCH=PPC64LE
+	MQ_ARCHIVE_ARCH:=PPC64LE
+	MQ_ARCHIVE_DEV_ARCH:=PPC64LE
 else ifeq "$(ARCH)" "s390x"
-	MQ_ARCHIVE_ARCH=S390X
+	MQ_ARCHIVE_ARCH:=S390X
+	MQ_ARCHIVE_DEV_ARCH:=S390X
+else ifeq "$(ARCH)" "arm64"
+	MQ_ARCHIVE_ARCH:=ARM64
+	MQ_ARCHIVE_DEV_ARCH:=ARM64
+endif
+
+# If this is a fake master build, push images to alternative location (pipeline wont consider these images GA candidates)
+ifeq ($(shell [ "$(TRAVIS)" = "true" ] && [ -n "$(MAIN_BRANCH)" ] && [ -n "$(SOURCE_BRANCH)" ] && [ "$(MAIN_BRANCH)" != "$(SOURCE_BRANCH)" ] && echo "true"), true)
+	MQ_DELIVERY_REGISTRY_NAMESPACE="master-fake"
 endif
 
 # LTS_TAG is the tag modifier for an LTS container build
@@ -160,6 +174,13 @@ endif
 
 ifeq ($(shell [ ! -z $(TRAVIS) ] && [ "$(TRAVIS_PULL_REQUEST)" = "false" ] && [ "$(TRAVIS_BRANCH)" = "$(MAIN_BRANCH)" ] && echo true), true)
 	MQ_MANIFEST_TAG_SUFFIX=.$(TIMESTAMPFLAT).$(GIT_COMMIT)
+endif
+
+# Make sure we don't use VOLUME_MOUNT_OPTIONS for Podman on macOS
+ifeq "$(COMMAND)" "podman"
+	ifeq "$(shell uname -s)" "Darwin"
+		VOLUME_MOUNT_OPTIONS:=
+	endif
 endif
 
 PATH_TO_MQ_TAG_CACHE=$(TRAVIS_BUILD_DIR)/.tagcache
@@ -216,16 +237,16 @@ downloads/$(MQ_ARCHIVE_DEV):
 	mkdir -p downloads
 ifneq "$(BUILD_RSYNC_SERVER)" "$(EMPTY)"
 # Use key which is not stored in the repository to fetch the files from the fileserver
-	curl -L $(BUILD_RSYNC_ENCRYPTED_KEY_URL) -o ./host.key.gpg
+	curl --fail --location $(BUILD_RSYNC_ENCRYPTED_KEY_URL) --output ./host.key.gpg
 	@echo $(BUILD_RSYNC_ENCRYPTION_PASSWORD)|gpg --batch --passphrase-fd 0 ./host.key.gpg
 	chmod 600 ./host.key
 	rsync -rv -e "ssh -o BatchMode=yes -q -o StrictHostKeyChecking=no -i ./host.key" --include="*/" --include="*.tar.gz" --exclude="*" $(BUILD_RSYNC_USER)@$(BUILD_RSYNC_SERVER):"$(BUILD_RSYNC_PATH)" downloads/$(MQ_ARCHIVE_DEV)
 	-@rm host.key.gpg host.key
 else
 ifneq "$(MQ_ARCHIVE_REPOSITORY_DEV)" "$(EMPTY)"
-	curl -u $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) -X GET "$(MQ_ARCHIVE_REPOSITORY_DEV)" -o downloads/$(MQ_ARCHIVE_DEV)
+	curl --fail --user $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) --request GET "$(MQ_ARCHIVE_REPOSITORY_DEV)" --output downloads/$(MQ_ARCHIVE_DEV)
 else
-	curl -L https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqadv/$(MQ_ARCHIVE_DEV) -o downloads/$(MQ_ARCHIVE_DEV)
+	curl --fail --location https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqadv/$(MQ_ARCHIVE_DEV) --output downloads/$(MQ_ARCHIVE_DEV)
 endif
 endif
 
@@ -235,14 +256,14 @@ downloads/$(MQ_ARCHIVE):
 ifneq "$(BUILD_RSYNC_SERVER)" "$(EMPTY)"
 # Use key which is not stored in the repository to fetch the files from the fileserver
 	-@rm host.key.gpg host.key
-	curl -L $(BUILD_RSYNC_ENCRYPTED_KEY_URL) -o ./host.key.gpg
+	curl --fail --location $(BUILD_RSYNC_ENCRYPTED_KEY_URL) --output ./host.key.gpg
 	@echo $(BUILD_RSYNC_ENCRYPTION_PASSWORD)|gpg --batch --passphrase-fd 0 ./host.key.gpg
 	chmod 600 ./host.key
 	rsync -rv -e "ssh -o BatchMode=yes -q -o StrictHostKeyChecking=no -i ./host.key" --include="*/" --include="*.tar.gz" --exclude="*" $(BUILD_RSYNC_USER)@$(BUILD_RSYNC_SERVER):"$(BUILD_RSYNC_PATH)" downloads/$(MQ_ARCHIVE)
 	-@rm host.key.gpg host.key
 else
 ifneq "$(MQ_ARCHIVE_REPOSITORY)" "$(EMPTY)"
-	curl -u $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) -X GET "$(MQ_ARCHIVE_REPOSITORY)" -o downloads/$(MQ_ARCHIVE)
+	curl --fail --user $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) --request GET "$(MQ_ARCHIVE_REPOSITORY)" --output downloads/$(MQ_ARCHIVE)
 endif
 endif
 
@@ -253,9 +274,13 @@ downloads: downloads/$(MQ_ARCHIVE_DEV) downloads/$(MQ_SDK_ARCHIVE)
 cache-mq-tag:
 	@printf "MQ_MANIFEST_TAG=$(MQ_MANIFEST_TAG)\n" | tee $(PATH_TO_MQ_TAG_CACHE)
 
-# Vendor Go dependencies for the Docker tests
-test/docker/vendor:
-	cd test/docker && go mod vendor
+###############################################################################
+# Test targets
+###############################################################################
+
+# Vendor Go dependencies for the Container tests
+test/container/vendor:
+	cd test/container && go mod vendor
 
 # Shortcut to just run the unit tests
 .PHONY: test-unit
@@ -263,28 +288,28 @@ test-unit:
 	$(COMMAND) build --target builder --file Dockerfile-server .
 
 .PHONY: test-advancedserver
-test-advancedserver: test/docker/vendor
+test-advancedserver: test/container/vendor
 	$(info $(SPACER)$(shell printf $(TITLE)"Test $(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG) on $(shell $(COMMAND) --version)"$(END)))
 	$(COMMAND) inspect $(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG)
-	cd test/docker && TEST_IMAGE=$(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG) EXPECTED_LICENSE=Production go test -parallel $(NUM_CPU) -timeout $(TEST_TIMEOUT_DOCKER) $(TEST_OPTS_DOCKER)
+	cd test/container && TEST_IMAGE=$(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG) EXPECTED_LICENSE=Production DOCKER_API_VERSION=$(DOCKER_API_VERSION) COMMAND=$(COMMAND) go test -parallel $(NUM_CPU) -timeout $(TEST_TIMEOUT_CONTAINER) $(TEST_OPTS_CONTAINER)
 
 .PHONY: build-devjmstest
-build-devjmstest: registry-login
+build-devjmstest:
 	$(info $(SPACER)$(shell printf $(TITLE)"Build JMS tests for developer config"$(END)))
-	cd test/messaging && docker build --tag $(DEV_JMS_IMAGE) .
+	cd test/messaging && $(COMMAND) build --tag $(DEV_JMS_IMAGE) .
 
 .PHONY: test-devserver
-test-devserver: test/docker/vendor
+test-devserver: test/container/vendor
 	$(info $(SPACER)$(shell printf $(TITLE)"Test $(MQ_IMAGE_DEVSERVER):$(MQ_TAG) on $(shell $(COMMAND) --version)"$(END)))
 	$(COMMAND) inspect $(MQ_IMAGE_DEVSERVER):$(MQ_TAG)
-	cd test/docker && TEST_IMAGE=$(MQ_IMAGE_DEVSERVER):$(MQ_TAG) EXPECTED_LICENSE=Developer DEV_JMS_IMAGE=$(DEV_JMS_IMAGE) IBMJRE=true go test -parallel $(NUM_CPU) -timeout $(TEST_TIMEOUT_DOCKER) -tags mqdev $(TEST_OPTS_DOCKER)
+	cd test/container && TEST_IMAGE=$(MQ_IMAGE_DEVSERVER):$(MQ_TAG) EXPECTED_LICENSE=Developer DEV_JMS_IMAGE=$(DEV_JMS_IMAGE) IBMJRE=false DOCKER_API_VERSION=$(DOCKER_API_VERSION) COMMAND=$(COMMAND) go test -parallel $(NUM_CPU) -timeout $(TEST_TIMEOUT_CONTAINER) -tags mqdev $(TEST_OPTS_CONTAINER)
 
 .PHONY: coverage
 coverage:
 	mkdir coverage
 
 .PHONY: test-advancedserver-cover
-test-advancedserver-cover: test/docker/vendor coverage
+test-advancedserver-cover: test/container/vendor coverage
 	$(info $(SPACER)$(shell printf $(TITLE)"Test $(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG) with code coverage on $(shell $(COMMAND) --version)"$(END)))
 	rm -f ./coverage/unit*.cov
 	# Run unit tests with coverage, for each package under 'internal'
@@ -294,31 +319,35 @@ test-advancedserver-cover: test/docker/vendor coverage
 	tail -q -n +2 ./coverage/unit-*.cov >> ./coverage/unit.cov
 	go tool cover -html=./coverage/unit.cov -o ./coverage/unit.html
 
-	rm -f ./test/docker/coverage/*.cov
-	rm -f ./coverage/docker.*
-	mkdir -p ./test/docker/coverage/
-	cd test/docker && TEST_IMAGE=$(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG)-cover TEST_COVER=true go test $(TEST_OPTS_DOCKER)
-	echo 'mode: count' > ./coverage/docker.cov
-	tail -q -n +2 ./test/docker/coverage/*.cov >> ./coverage/docker.cov
-	go tool cover -html=./coverage/docker.cov -o ./coverage/docker.html
+	rm -f ./test/container/coverage/*.cov
+	rm -f ./coverage/container.*
+	mkdir -p ./test/container/coverage/
+	cd test/container && TEST_IMAGE=$(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG)-cover TEST_COVER=true DOCKER_API_VERSION=$(DOCKER_API_VERSION) go test $(TEST_OPTS_CONTAINER)
+	echo 'mode: count' > ./coverage/container.cov
+	tail -q -n +2 ./test/container/coverage/*.cov >> ./coverage/container.cov
+	go tool cover -html=./coverage/container.cov -o ./coverage/container.html
 
 	echo 'mode: count' > ./coverage/combined.cov
-	tail -q -n +2 ./coverage/unit.cov ./coverage/docker.cov  >> ./coverage/combined.cov
+	tail -q -n +2 ./coverage/unit.cov ./coverage/container.cov  >> ./coverage/combined.cov
 	go tool cover -html=./coverage/combined.cov -o ./coverage/combined.html
 
-# Build an MQ image.  The commands used are slightly different between Docker and Podman
+###############################################################################
+# Build functions
+###############################################################################
+
+# Command to build the image
+# Args: imageName, imageTag, dockerfile, extraArgs, dockerfileTarget
+# If the ARCH variable has been changed from the default value (arch_go variable), then the `--platform` parameter is added
+# Args: imageName, imageTag, dockerfile, mqArchive, dockerfileTarget
 define build-mq
-	$(if $(findstring docker,$(COMMAND)), @docker network create build,)
-	$(if $(findstring docker,$(COMMAND)), @docker run --rm --name $(BUILD_SERVER_CONTAINER) --network build --network-alias build --volume $(DOWNLOADS_DIR):/opt/app-root/src$(VOLUME_MOUNT_OPTIONS) --detach registry.redhat.io/ubi8/nginx-118 nginx -g "daemon off;",)
-	$(eval EXTRA_ARGS=$(if $(findstring docker,$(COMMAND)), --network build --build-arg MQ_URL=http://build:8080/$4, --volume $(DOWNLOADS_DIR):/var/downloads$(VOLUME_MOUNT_OPTIONS) --build-arg MQ_URL=file:///var/downloads/$4))
-	# Build the new image
+	rm -f .dockerignore && echo ".git\ndownloads\n!downloads/$4" > .dockerignore
 	$(COMMAND) build \
 	  --tag $1:$2 \
 	  --file $3 \
-	  $(EXTRA_ARGS) \
 	  --build-arg IMAGE_REVISION="$(IMAGE_REVISION)" \
 	  --build-arg IMAGE_SOURCE="$(IMAGE_SOURCE)" \
 	  --build-arg IMAGE_TAG="$1:$2" \
+	  --build-arg MQ_ARCHIVE="downloads/$4" \
 	  --label version=$(MQ_VERSION) \
 	  --label name=$1 \
 	  --label build-date=$(shell date +%Y-%m-%dT%H:%M:%S%z) \
@@ -327,32 +356,20 @@ define build-mq
 	  --label vcs-ref=$(IMAGE_REVISION) \
 	  --label vcs-type=git \
 	  --label vcs-url=$(IMAGE_SOURCE) \
+	  $(if $(findstring $(arch_go),$(ARCH)),,--platform=linux/$(ARCH)) \
 	  $(EXTRA_LABELS) \
 	  --target $5 \
-	  . 
-	$(if $(findstring docker,$(COMMAND)), @docker kill $(BUILD_SERVER_CONTAINER))
-	$(if $(findstring docker,$(COMMAND)), @docker network rm build)
+	  .
 endef
 
-COMMAND_SERVER_VERSION=$(shell $(COMMAND) version --format "{{ .Server.Version }}")
-COMMAND_CLIENT_VERSION=$(shell $(COMMAND) version --format "{{ .Client.Version }}")
-PODMAN_VERSION=$(shell podman version --format "{{ .Version }}")
-.PHONY: command-version
-command-version:
-# If we're using Docker, then check it's recent enough to support multi-stage builds
-ifneq (,$(findstring docker,$(COMMAND)))
-	@test "$(word 1,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -ge "17" || ("$(word 1,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -eq "17" && "$(word 2,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -ge "05") || (echo "Error: Docker client 17.05 or greater is required" && exit 1)
-	@test "$(word 1,$(subst ., ,$(COMMAND_SERVER_VERSION)))" -ge "17" || ("$(word 1,$(subst ., ,$(COMMAND_SERVER_VERSION)))" -eq "17" && "$(word 2,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -ge "05") || (echo "Error: Docker server 17.05 or greater is required" && exit 1)
-endif
-ifneq (,$(findstring podman,$(COMMAND)))
-	@test "$(word 1,$(subst ., ,$(PODMAN_VERSION)))" -ge "1" || (echo "Error: Podman version 1.0 or greater is required" && exit 1)
-endif
-
+###############################################################################
+# Build targets
+###############################################################################
 .PHONY: build-advancedserver-host
 build-advancedserver-host: build-advancedserver
 
 .PHONY: build-advancedserver
-build-advancedserver: registry-login log-build-env downloads/$(MQ_ARCHIVE) command-version
+build-advancedserver: log-build-env downloads/$(MQ_ARCHIVE) command-version
 	$(info $(SPACER)$(shell printf $(TITLE)"Build $(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG)"$(END)))
 	$(call build-mq,$(MQ_IMAGE_ADVANCEDSERVER),$(MQ_TAG),Dockerfile-server,$(MQ_ARCHIVE),mq-server)
 
@@ -360,40 +377,39 @@ build-advancedserver: registry-login log-build-env downloads/$(MQ_ARCHIVE) comma
 build-devserver-host: build-devserver
 
 .PHONY: build-devserver
-build-devserver: registry-login log-build-env downloads/$(MQ_ARCHIVE_DEV) command-version
+build-devserver: log-build-env downloads/$(MQ_ARCHIVE_DEV) command-version
 	$(info $(shell printf $(TITLE)"Build $(MQ_IMAGE_DEVSERVER):$(MQ_TAG)"$(END)))
 	$(call build-mq,$(MQ_IMAGE_DEVSERVER),$(MQ_TAG),Dockerfile-server,$(MQ_ARCHIVE_DEV),mq-dev-server)
 
 .PHONY: build-advancedserver-cover
-build-advancedserver-cover: registry-login command-version
+build-advancedserver-cover: command-version
 	$(COMMAND) build --build-arg BASE_IMAGE=$(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG) -t $(MQ_IMAGE_ADVANCEDSERVER):$(MQ_TAG)-cover -f Dockerfile-server.cover .
 
 .PHONY: build-explorer
-build-explorer: registry-login downloads/$(MQ_ARCHIVE_DEV)
+build-explorer: downloads/$(MQ_ARCHIVE_DEV)
 	$(call build-mq,mq-explorer,latest-$(ARCH),incubating/mq-explorer/Dockerfile,$(MQ_ARCHIVE_DEV),mq-explorer)
 
 .PHONY: build-sdk
-build-sdk: registry-login downloads/$(MQ_ARCHIVE_DEV)
+build-sdk: downloads/$(MQ_ARCHIVE_DEV)
 	$(info $(shell printf $(TITLE)"Build $(MQ_IMAGE_SDK)"$(END)))
 	$(call build-mq,mq-sdk,$(MQ_TAG),incubating/mq-sdk/Dockerfile,$(MQ_SDK_ARCHIVE),mq-sdk)
 
-.PHONY: registry-login
-registry-login:
-ifneq ($(REGISTRY_USER),)
-	$(COMMAND) login -u $(REGISTRY_USER) -p $(REGISTRY_PASS) registry.redhat.io
-endif
-
+###############################################################################
+# Logging targets
+###############################################################################
 .PHONY: log-build-env
 log-build-vars:
 	$(info $(SPACER)$(shell printf $(TITLE)"Build environment"$(END)))
-	@echo ARCH=$(ARCH)
-	@echo MQ_VERSION=$(MQ_VERSION)
-	@echo MQ_ARCHIVE=$(MQ_ARCHIVE)
+	@echo arch_uname=$(arch_uname)
+	@echo arch_go=$(arch_go)
+	@echo "ARCH=$(ARCH) (origin:$(origin ARCH))"
+	@echo MQ_VERSION="$(MQ_VERSION) (origin:$(origin MQ_VERSION))"
+	@echo MQ_ARCHIVE="$(MQ_ARCHIVE) (origin:$(origin MQ_ARCHIVE))"
+	@echo MQ_ARCHIVE_DEV_ARCH=$(MQ_ARCHIVE_DEV_ARCH)
 	@echo MQ_ARCHIVE_DEV=$(MQ_ARCHIVE_DEV)
 	@echo MQ_IMAGE_DEVSERVER=$(MQ_IMAGE_DEVSERVER)
 	@echo MQ_IMAGE_ADVANCEDSERVER=$(MQ_IMAGE_ADVANCEDSERVER)
 	@echo COMMAND=$(COMMAND)
-	@echo REGISTRY_USER=$(REGISTRY_USER)
 
 .PHONY: log-build-env
 log-build-env: log-build-vars
@@ -403,16 +419,22 @@ log-build-env: log-build-vars
 
 include formatting.mk
 
+###############################################################################
+# Push/pull targets
+###############################################################################
 .PHONY: pull-mq-archive
 pull-mq-archive:
-	curl -u $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) -X GET "$(MQ_ARCHIVE_REPOSITORY)" -o downloads/$(MQ_ARCHIVE)
+	curl --fail --user $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) --request GET "$(MQ_ARCHIVE_REPOSITORY)" --output downloads/$(MQ_ARCHIVE)
 
 .PHONY: pull-mq-archive-dev
 pull-mq-archive-dev:
-	curl -u $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) -X GET "$(MQ_ARCHIVE_REPOSITORY_DEV)" -o downloads/$(MQ_ARCHIVE_DEV)
+	curl --fail --user $(MQ_ARCHIVE_REPOSITORY_USER):$(MQ_ARCHIVE_REPOSITORY_CREDENTIAL) --request GET "$(MQ_ARCHIVE_REPOSITORY_DEV)" --output downloads/$(MQ_ARCHIVE_DEV)
 
 .PHONY: push-advancedserver
 push-advancedserver:
+	@if [ $(MQ_DELIVERY_REGISTRY_NAMESPACE) = "master-fake" ]; then\
+		echo "Detected fake master build. Note that the push destination is set to the fake master namespace: $(MQ_DELIVERY_REGISTRY_FULL_PATH)";\
+	fi
 	$(info $(SPACER)$(shell printf $(TITLE)"Push production image to $(MQ_DELIVERY_REGISTRY_FULL_PATH)"$(END)))
 	$(COMMAND) login $(MQ_DELIVERY_REGISTRY_HOSTNAME) -u $(MQ_DELIVERY_REGISTRY_USER) -p $(MQ_DELIVERY_REGISTRY_CREDENTIAL)
 	$(COMMAND) tag $(MQ_IMAGE_ADVANCEDSERVER)\:$(MQ_TAG) $(MQ_DELIVERY_REGISTRY_FULL_PATH)/$(MQ_IMAGE_FULL_RELEASE_NAME)
@@ -420,6 +442,9 @@ push-advancedserver:
 
 .PHONY: push-devserver
 push-devserver:
+	@if [ $(MQ_DELIVERY_REGISTRY_NAMESPACE) = "master-fake" ]; then\
+		echo "Detected fake master build. Note that the push destination is set to the fake master namespace: $(MQ_DELIVERY_REGISTRY_FULL_PATH)";\
+	fi
 	$(info $(SPACER)$(shell printf $(TITLE)"Push developer image to $(MQ_DELIVERY_REGISTRY_FULL_PATH)"$(END)))
 	$(COMMAND) login $(MQ_DELIVERY_REGISTRY_HOSTNAME) -u $(MQ_DELIVERY_REGISTRY_USER) -p $(MQ_DELIVERY_REGISTRY_CREDENTIAL)
 	$(COMMAND) tag $(MQ_IMAGE_DEVSERVER)\:$(MQ_TAG) $(MQ_DELIVERY_REGISTRY_FULL_PATH)/$(MQ_IMAGE_DEV_FULL_RELEASE_NAME)
@@ -467,6 +492,10 @@ endif
 build-skopeo-container:
 	$(COMMAND) images | grep -q "skopeo"; if [ $$? != 0 ]; then $(COMMAND) build -t skopeo:latest ./docker-builds/skopeo/; fi
 
+###############################################################################
+# Other targets
+###############################################################################
+
 .PHONY: clean
 clean:
 	rm -rf ./coverage
@@ -504,41 +533,38 @@ lint: $(addsuffix /$(wildcard *.go), $(GO_PKG_DIRS))
 .PHONY: gosec
 gosec:
 	$(info $(SPACER)$(shell printf "Running gosec test"$(END)))
-	@gosec -fmt=json -out=gosec_results.json cmd/... internal/... 2> /dev/null ;\
-	cat "gosec_results.json" ;\
-	cat gosec_results.json | grep HIGH | grep severity > /dev/null ;\
-	if [ $$? -eq 0 ]; then \
-		printf "\nFAILURE: gosec found files containing HIGH severity issues - see results.json\n" ;\
+	@gosecrc=0; gosec -fmt=json -out=gosec_results.json cmd/... internal/... 2> /dev/null || gosecrc=$$?; \
+	cat gosec_results.json | jq '{"GolangErrors": (.["Golang errors"]|length>0),"Issues":(.Issues|length>0)}' | grep 'true' >/dev/null ;\
+	if [ $$? -eq 0 ] || [ $$gosecrc -ne 0 ]; then \
+		printf "FAILURE: Issues found running gosec - see gosec_results.json\n" ;\
+		cat "gosec_results.json" ;\
 		exit 1 ;\
 	else \
-		printf "\ngosec found no HIGH severity issues\n" ;\
-	fi ;\
-	cat gosec_results.json | grep MEDIUM | grep severity > /dev/null ;\
-	if [ $$? -eq 0 ]; then \
-		printf "\nFAILURE: gosec found files containing MEDIUM severity issues - see results.json\n" ;\
-		exit 1 ;\
-	else \
-		printf "\ngosec found no MEDIUM severity issues\n" ;\
-	fi ;\
-	cat gosec_results.json | grep LOW | grep severity > /dev/null;\
-	if [ $$? -eq 0 ]; then \
-		printf "\nFAILURE: gosec found files containing LOW severity issues - see results.json\n" ;\
-		exit 1;\
-	else \
-		printf "\ngosec found no LOW severity issues\n" ;\
-fi ;\
-
-include formatting.mk
+		printf "gosec found no issues\n" ;\
+		cat "gosec_results.json" ;\
+	fi
 
 .PHONY: update-release-information
 update-release-information:
-	sed -i.bak 's/ARG MQ_URL=.*-LinuxX64.tar.gz"/ARG MQ_URL="https:\/\/public.dhe.ibm.com\/ibmdl\/export\/pub\/software\/websphere\/messaging\/mqadv\/$(MQ_VERSION)-IBM-MQ-Advanced-for-Developers-Non-Install-LinuxX64.tar.gz"/g' Dockerfile-server && rm Dockerfile-server.bak
-	$(eval MQ_VERSION_1=$(shell echo '${MQ_VERSION}' | rev | cut -c 3- | rev))
-	sed -i.bak 's/IBM_MQ_.*_LINUX_X86-64_NOINST.tar.gz/IBM_MQ_${MQ_VERSION_1}_LINUX_X86-64_NOINST.tar.gz/g' docs/building.md && rm docs/building.md.bak
+	sed -i.bak 's/ARG MQ_ARCHIVE=.*-LinuxX64.tar.gz"/ARG MQ_ARCHIVE="downloads\/$(MQ_VERSION)-IBM-MQ-Advanced-for-Developers-Non-Install-LinuxX64.tar.gz"/g' Dockerfile-server && rm Dockerfile-server.bak
 	sed -i.bak 's/ibm-mqadvanced-server:.*-amd64/ibm-mqadvanced-server:$(MQ_VERSION)-amd64/g' docs/security.md
 	sed -i.bak 's/ibm-mqadvanced-server-dev.*-amd64/ibm-mqadvanced-server-dev:$(MQ_VERSION)-amd64/g' docs/security.md && rm docs/security.md.bak
 	sed -i.bak 's/MQ_IMAGE_ADVANCEDSERVER=ibm-mqadvanced-server:.*-amd64/MQ_IMAGE_ADVANCEDSERVER=ibm-mqadvanced-server:$(MQ_VERSION)-amd64/g' docs/testing.md && rm docs/testing.md.bak
-	$(eval MQ_VERSION_2=$(shell echo '${MQ_VERSION_1}' | rev | cut -c 3- | rev))
-	sed -i.bak 's/knowledgecenter\/SSFKSJ_.*\/com/knowledgecenter\/SSFKSJ_${MQ_VERSION_2}.0\/com/g' docs/usage.md && rm docs/usage.md.bak
-	$(eval MQ_VERSION_3=$(shell echo '${MQ_VERSION_1}' | sed "s/\.//g"))
-	sed -i.bak 's/MQ_..._ARCHIVE_REPOSITORY/MQ_${MQ_VERSION_3}_ARCHIVE_REPOSITORY/g' .travis.yml && rm .travis.yml.bak
+	$(eval MQ_VERSION_VR=$(subst $(SPACE),.,$(wordlist 1,2,$(subst .,$(SPACE),$(MQ_VERSION_VRM)))))
+	sed -i.bak 's/knowledgecenter\/SSFKSJ_.*\/com/knowledgecenter\/SSFKSJ_${MQ_VERSION_VR}.0\/com/g' docs/usage.md && rm docs/usage.md.bak
+	$(eval MQ_VERSION_VRM_FLAT=$(shell echo '${MQ_VERSION_VRM}' | sed "s/\.//g"))
+	sed -i.bak 's/MQ_..._ARCHIVE_REPOSITORY/MQ_${MQ_VERSION_VRM_FLAT}_ARCHIVE_REPOSITORY/g' .travis.yml && rm .travis.yml.bak
+
+COMMAND_SERVER_VERSION=$(shell $(COMMAND) version --format "{{ .Server.Version }}")
+COMMAND_CLIENT_VERSION=$(shell $(COMMAND) version --format "{{ .Client.Version }}")
+PODMAN_VERSION=$(shell podman version --format "{{ .Version }}")
+.PHONY: command-version
+command-version:
+# If we're using Docker, then check it's recent enough to support multi-stage builds
+ifneq (,$(findstring docker,$(COMMAND)))
+	@test "$(word 1,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -ge "17" || ("$(word 1,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -eq "17" && "$(word 2,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -ge "05") || (echo "Error: Docker client 17.05 or greater is required" && exit 1)
+	@test "$(word 1,$(subst ., ,$(COMMAND_SERVER_VERSION)))" -ge "17" || ("$(word 1,$(subst ., ,$(COMMAND_SERVER_VERSION)))" -eq "17" && "$(word 2,$(subst ., ,$(COMMAND_CLIENT_VERSION)))" -ge "05") || (echo "Error: Docker server 17.05 or greater is required" && exit 1)
+endif
+ifneq (,$(findstring podman,$(COMMAND)))
+	@test "$(word 1,$(subst ., ,$(PODMAN_VERSION)))" -ge "1" || (echo "Error: Podman version 1.0 or greater is required" && exit 1)
+endif

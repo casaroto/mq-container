@@ -1,5 +1,5 @@
 /*
-© Copyright IBM Corporation 2018, 2019
+© Copyright IBM Corporation 2018, 2023
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ limitations under the License.
 package ready
 
 import (
-	"io/ioutil"
+	"context"
 	"os"
 	"strings"
 
@@ -53,7 +53,8 @@ func Clear() error {
 // Set lets any subsequent calls to `CheckReady` know that the queue
 // manager has finished its configuration step
 func Set() error {
-	return ioutil.WriteFile(fileName, []byte("1"), 0770)
+	// #nosec G306 - this gives permissions to owner/s group only.
+	return os.WriteFile(fileName, []byte("1"), 0770)
 }
 
 // Check checks whether or not the queue manager has finished its
@@ -66,28 +67,38 @@ func Check() (bool, error) {
 	return exists, nil
 }
 
-// IsRunningAsActiveQM returns true if the queue manager is running in active mode
-func IsRunningAsActiveQM(name string) (bool, error) {
-	return isRunningQM(name, "(RUNNING)")
-}
-
-// IsRunningAsStandbyQM returns true if the queue manager is running in standby mode
-func IsRunningAsStandbyQM(name string) (bool, error) {
-	return isRunningQM(name, "(RUNNING AS STANDBY)")
-}
-
-// IsRunningAsReplicaQM returns true if the queue manager is running in replica mode
-func IsRunningAsReplicaQM(name string) (bool, error) {
-	return isRunningQM(name, "(REPLICA)")
-}
-
-func isRunningQM(name string, status string) (bool, error) {
-	out, _, err := command.Run("dspmq", "-n", "-m", name)
+// Status returns an enum representing the current running status of the queue manager
+func Status(ctx context.Context, name string) (QMStatus, error) {
+	out, _, err := command.RunContext(ctx, "dspmq", "-n", "-m", name)
 	if err != nil {
-		return false, err
+		return StatusUnknown, err
 	}
-	if strings.Contains(string(out), status) {
-		return true, nil
+	if strings.Contains(string(out), "(RUNNING)") {
+		return StatusActiveQM, nil
 	}
-	return false, nil
+	if strings.Contains(string(out), "(RUNNING AS STANDBY)") {
+		return StatusStandbyQM, nil
+	}
+	if strings.Contains(string(out), "(REPLICA)") {
+		return StatusStandbyQM, nil
+	}
+	return StatusUnknown, nil
 }
+
+type QMStatus int
+
+const (
+	StatusUnknown QMStatus = iota
+	StatusActiveQM
+	StatusStandbyQM
+	StatusReplicaQM
+)
+
+// ActiveQM returns true if the queue manager is running in active mode
+func (s QMStatus) ActiveQM() bool { return s == StatusActiveQM }
+
+// StandbyQM returns true if the queue manager is running in standby mode
+func (s QMStatus) StandbyQM() bool { return s == StatusStandbyQM }
+
+// ReplicaQM returns true if the queue manager is running in replica mode
+func (s QMStatus) ReplicaQM() bool { return s == StatusReplicaQM }

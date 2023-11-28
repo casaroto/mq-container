@@ -1,6 +1,10 @@
 {
   "settingsInheritedFrom": "whitesource-config/whitesource-config@master",
   "scanSettings": {
-      "baseBranches": ["private-master", "v9.2.0.x-eus"]
-  }
+      "configMode": "LOCAL",
+      "baseBranches": ["private-master", "v9.3.3"]
+  },
+  "issueSettings": {
+      "issueRepoName": "whitesource-scan-issues"
+    }
 }
